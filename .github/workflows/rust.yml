@@ -1,0 +1,25 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      release_built: ${{ steps.set-output.outputs.release_built }}
+    steps:
+    - uses: actions/checkout@v5
+    - name: Build
+      run: cargo build --features sqlite,mysql,postgresql --release --verbose
+    - name: Upload release artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: vaultwarden
+        path: target/${{ matrix.BUILD_TARGET }}/vaultwarden
