@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
     outputs:
       release_built: ${{ steps.set-output.outputs.release_built }}
@@ -19,6 +19,6 @@ jobs:
     - name: Build
       run: cargo build --features sqlite,mysql,postgresql --release --verbose
     - name: Release Vaultwarden
-      uses: oftprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v2
       with:
         files: target/release/vaultwarden
