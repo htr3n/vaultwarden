@@ -18,8 +18,7 @@ jobs:
     - uses: actions/checkout@v5
     - name: Build
       run: cargo build --features sqlite,mysql,postgresql --release --verbose
-    - name: Upload release artifact
-      uses: actions/upload-artifact@v4
+    - name: Release Vaultwarden
+      uses: oftprops/action-gh-release@v2
       with:
-        name: vaultwarden
-        path: target/release/vaultwarden
+        files: target/release/vaultwarden
