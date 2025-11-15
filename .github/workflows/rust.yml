@@ -15,14 +15,19 @@ jobs:
     outputs:
       release_built: ${{ steps.set-output.outputs.release_built }}
     steps:
+    - name: Find the latest tag
+      uses:  oprypin/find-latest-tag@v1
+      with: 
+        repository: htr3n/vaultwarden
+      id: repo
     - name: Checkout
       uses: actions/checkout@v5
       with:
-        ref: "$(git describe --tags --abbrev=0)"
+        ref: ${{ steps.repo.outputs.tag }}
     - name: Build
       run: cargo build --features sqlite,mysql,postgresql --release --verbose
     - name: Release
       uses: softprops/action-gh-release@v2
       with:
         files: target/release/vaultwarden
-        tag_name: "$(git describe --tags --abbrev=0)"
+        tag_name: ${{ steps.repo.outputs.tag }}
