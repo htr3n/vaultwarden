@@ -1,21 +1,25 @@
 use std::{borrow::Cow, sync::LazyLock, time::Duration};
 
-use mini_moka::sync::Cache;
 use openidconnect::{core::*, reqwest, *};
 use regex::Regex;
 use url::Url;
 
 use crate::{
     api::{ApiResult, EmptyResult},
-    db::models::SsoNonce,
-    sso::{OIDCCode, OIDCState},
+    db::models::SsoAuth,
+    sso::{OIDCCode, OIDCCodeChallenge, OIDCCodeVerifier, OIDCState},
     CONFIG,
 };
 
 static CLIENT_CACHE_KEY: LazyLock<String> = LazyLock::new(|| "sso-client".to_string());
-static CLIENT_CACHE: LazyLock<Cache<String, Client>> = LazyLock::new(|| {
-    Cache::builder().max_capacity(1).time_to_live(Duration::from_secs(CONFIG.sso_client_cache_expiration())).build()
+static CLIENT_CACHE: LazyLock<moka::sync::Cache<String, Client>> = LazyLock::new(|| {
+    moka::sync::Cache::builder()
+        .max_capacity(1)
+        .time_to_live(Duration::from_secs(CONFIG.sso_client_cache_expiration()))
+        .build()
 });
+static REFRESH_CACHE: LazyLock<moka::future::Cache<String, Result<RefreshTokenResponse, String>>> =
+    LazyLock::new(|| moka::future::Cache::builder().max_capacity(1000).time_to_live(Duration::from_secs(30)).build());
 
 /// OpenID Connect Core client.
 pub type CustomClient = openidconnect::Client<
@@ -37,6 +41,8 @@ pub type CustomClient = openidconnect::Client<
     EndpointSet,
     EndpointSet,
 >;
+
+pub type RefreshTokenResponse = (Option<String>, String, Option<Duration>);
 
 #[derive(Clone)]
 pub struct Client {
@@ -107,7 +113,11 @@ impl Client {
     }
 
     // The `state` is encoded using base64 to ensure no issue with providers (It contains the Organization identifier).
-    pub async fn authorize_url(state: OIDCState, redirect_uri: String) -> ApiResult<(Url, SsoNonce)> {
+    pub async fn authorize_url(
+        state: OIDCState,
+        client_challenge: OIDCCodeChallenge,
+        redirect_uri: String,
+    ) -> ApiResult<(Url, SsoAuth)> {
         let scopes = CONFIG.sso_scopes_vec().into_iter().map(Scope::new);
         let base64_state = data_encoding::BASE64.encode(state.to_string().as_bytes());
 
@@ -122,22 +132,21 @@ impl Client {
             .add_scopes(scopes)
             .add_extra_params(CONFIG.sso_authorize_extra_params_vec());
 
-        let verifier = if CONFIG.sso_pkce() {
-            let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-            auth_req = auth_req.set_pkce_challenge(pkce_challenge);
-            Some(pkce_verifier.into_secret())
-        } else {
-            None
-        };
+        if CONFIG.sso_pkce() {
+            auth_req = auth_req
+                .add_extra_param::<&str, String>("code_challenge", client_challenge.clone().into())
+                .add_extra_param("code_challenge_method", "S256");
+        }
 
         let (auth_url, _, nonce) = auth_req.url();
-        Ok((auth_url, SsoNonce::new(state, nonce.secret().clone(), verifier, redirect_uri)))
+        Ok((auth_url, SsoAuth::new(state, client_challenge, nonce.secret().clone(), redirect_uri)))
     }
 
     pub async fn exchange_code(
         &self,
         code: OIDCCode,
-        nonce: SsoNonce,
+        client_verifier: OIDCCodeVerifier,
+        sso_auth: &SsoAuth,
     ) -> ApiResult<(
         StandardTokenResponse<
             IdTokenFields<
@@ -155,17 +164,21 @@ impl Client {
 
         let mut exchange = self.core_client.exchange_code(oidc_code);
 
+        let verifier = PkceCodeVerifier::new(client_verifier.into());
         if CONFIG.sso_pkce() {
-            match nonce.verifier {
-                None => err!(format!("Missing verifier in the DB nonce table")),
-                Some(secret) => exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(secret)),
+            exchange = exchange.set_pkce_verifier(verifier);
+        } else {
+            let challenge = PkceCodeChallenge::from_code_verifier_sha256(&verifier);
+            if challenge.as_str() != String::from(sso_auth.client_challenge.clone()) {
+                err!(format!("PKCE client challenge failed"))
+                // Might need to notify admin ? how ?
             }
         }
 
         match exchange.request_async(&self.http_client).await {
             Err(err) => err!(format!("Failed to contact token endpoint: {:?}", err)),
             Ok(token_response) => {
-                let oidc_nonce = Nonce::new(nonce.nonce);
+                let oidc_nonce = Nonce::new(sso_auth.nonce.clone());
 
                 let id_token = match token_response.extra_fields().id_token() {
                     None => err!("Token response did not contain an id_token"),
@@ -224,23 +237,29 @@ impl Client {
         verifier
     }
 
-    pub async fn exchange_refresh_token(
-        refresh_token: String,
-    ) -> ApiResult<(Option<String>, String, Option<Duration>)> {
+    pub async fn exchange_refresh_token(refresh_token: String) -> ApiResult<RefreshTokenResponse> {
+        let client = Client::cached().await?;
+
+        REFRESH_CACHE
+            .get_with(refresh_token.clone(), async move { client._exchange_refresh_token(refresh_token).await })
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn _exchange_refresh_token(&self, refresh_token: String) -> Result<RefreshTokenResponse, String> {
         let rt = RefreshToken::new(refresh_token);
 
-        let client = Client::cached().await?;
-        let token_response =
-            match client.core_client.exchange_refresh_token(&rt).request_async(&client.http_client).await {
-                Err(err) => err!(format!("Request to exchange_refresh_token endpoint failed: {:?}", err)),
-                Ok(token_response) => token_response,
-            };
-
-        Ok((
-            token_response.refresh_token().map(|token| token.secret().clone()),
-            token_response.access_token().secret().clone(),
-            token_response.expires_in(),
-        ))
+        match self.core_client.exchange_refresh_token(&rt).request_async(&self.http_client).await {
+            Err(err) => {
+                error!("Request to exchange_refresh_token endpoint failed: {err}");
+                Err(format!("Request to exchange_refresh_token endpoint failed: {err}"))
+            }
+            Ok(token_response) => Ok((
+                token_response.refresh_token().map(|token| token.secret().clone()),
+                token_response.access_token().secret().clone(),
+                token_response.expires_in(),
+            )),
+        }
     }
 }
 

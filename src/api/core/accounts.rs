@@ -33,7 +33,6 @@ use rocket::{
 
 pub fn routes() -> Vec<rocket::Route> {
     routes![
-        register,
         profile,
         put_profile,
         post_profile,
@@ -66,6 +65,7 @@ pub fn routes() -> Vec<rocket::Route> {
         put_device_token,
         put_clear_device_token,
         post_clear_device_token,
+        get_tasks,
         post_auth_request,
         get_auth_request,
         put_auth_request,
@@ -165,11 +165,6 @@ async fn is_email_2fa_required(member_id: Option<MembershipId>, conn: &DbConn) -
         return OrgPolicy::is_enabled_for_member(&member_id, OrgPolicyType::TwoFactorAuthentication, conn).await;
     }
     false
-}
-
-#[post("/accounts/register", data = "<data>")]
-async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
-    _register(data, false, conn).await
 }
 
 pub async fn _register(data: Json<RegisterData>, email_verification: bool, conn: DbConn) -> JsonResult {
@@ -378,7 +373,7 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
     }
 
     if let Some(identifier) = data.org_identifier {
-        if identifier != crate::sso::FAKE_IDENTIFIER {
+        if identifier != crate::sso::FAKE_IDENTIFIER && identifier != crate::api::admin::FAKE_ADMIN_UUID {
             let org = match Organization::find_by_uuid(&identifier.into(), &conn).await {
                 None => err!("Failed to retrieve the associated organization"),
                 Some(org) => org,
@@ -405,8 +400,8 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
     user.save(&conn).await?;
 
     Ok(Json(json!({
-      "Object": "set-password",
-      "CaptchaBypassToken": "",
+      "object": "set-password",
+      "captchaBypassToken": "",
     })))
 }
 
@@ -1198,10 +1193,9 @@ async fn password_hint(data: Json<PasswordHintData>, conn: DbConn) -> EmptyResul
                 // There is still a timing side channel here in that the code
                 // paths that send mail take noticeably longer than ones that
                 // don't. Add a randomized sleep to mitigate this somewhat.
-                use rand::{rngs::SmallRng, Rng, SeedableRng};
-                let mut rng = SmallRng::from_os_rng();
-                let delta: i32 = 100;
-                let sleep_ms = (1_000 + rng.random_range(-delta..=delta)) as u64;
+                use rand::{rngs::SmallRng, RngExt};
+                let mut rng: SmallRng = rand::make_rng();
+                let sleep_ms = rng.random_range(900..=1100) as u64;
                 tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
                 Ok(())
             } else {
@@ -1409,7 +1403,7 @@ async fn put_device_token(device_id: DeviceId, data: Json<PushToken>, headers: H
     }
 
     device.push_token = Some(token);
-    if let Err(e) = device.save(&conn).await {
+    if let Err(e) = device.save(true, &conn).await {
         err!(format!("An error occurred while trying to save the device push token: {e}"));
     }
 
@@ -1443,6 +1437,14 @@ async fn put_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResul
 #[post("/devices/identifier/<device_id>/clear-token")]
 async fn post_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResult {
     put_clear_device_token(device_id, conn).await
+}
+
+#[get("/tasks")]
+fn get_tasks(_client_headers: ClientHeaders) -> JsonResult {
+    Ok(Json(json!({
+        "data": [],
+        "object": "list"
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1695,6 +1697,6 @@ pub async fn purge_auth_requests(pool: DbPool) {
     if let Ok(conn) = pool.get().await {
         AuthRequest::purge_expired_auth_requests(&conn).await;
     } else {
-        error!("Failed to get DB connection while purging trashed ciphers")
+        error!("Failed to get DB connection while purging auth requests")
     }
 }
