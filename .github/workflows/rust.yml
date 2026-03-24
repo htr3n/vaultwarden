@@ -11,14 +11,12 @@ env:
 jobs:
   release:
     runs-on: ubuntu-latest
-    outputs:
-      release_built: ${{ steps.set-output.outputs.release_built }}
     steps:
     - name: Find the latest tag
       uses:  oprypin/find-latest-tag@v1
       with: 
         repository: htr3n/vaultwarden
-        releases-only: true
+        releases-only: false
       id: repo
     - name: Checkout
       uses: actions/checkout@v6
