@@ -2,9 +2,7 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    tags: ["v*.*.*"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,9 +17,10 @@ jobs:
       uses:  oprypin/find-latest-tag@v1
       with: 
         repository: htr3n/vaultwarden
+        releases-only: true
       id: repo
     - name: Checkout
-      uses: actions/checkout@v5
+      uses: actions/checkout@v6
       with:
         ref: ${{ steps.repo.outputs.tag }}
     - name: Build Vaultwarden
